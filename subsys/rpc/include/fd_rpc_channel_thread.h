@@ -26,6 +26,11 @@ void fd_rpc_channel_thread_initialize(const fd_rpc_channel_thread_configuration_
 
 otInstance *fd_rpc_channel_thread_get_ot_instance(void);
 
+// Hold the lock around OpenThread API calls made from outside the OpenThread thread.
+// Listeners are called from the configuration work queue without the lock held.
+void fd_rpc_channel_thread_lock(void);
+void fd_rpc_channel_thread_unlock(void);
+
 typedef enum {
     fd_rpc_channel_thread_state_none,
     fd_rpc_channel_thread_state_started,

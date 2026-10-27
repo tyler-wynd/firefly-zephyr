@@ -18,6 +18,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/hwinfo.h>
+#include <zephyr/net/openthread.h>
 #include <zephyr/sys/ring_buffer.h>
 
 #include <stdio.h>
@@ -81,6 +82,7 @@ typedef struct {
     struct k_work tx_work;
     struct k_timer timer;
     struct k_work timer_work;
+    struct k_work role_work;
 
     uint8_t rx_ring_buffer[CONFIG_FIREFLY_SUBSYS_RPC_THREAD_RX_BUFFER_SIZE];
     struct ring_buf rx_ringbuf;
@@ -108,6 +110,18 @@ otInstance *fd_rpc_channel_thread_get_ot_instance(void) {
     return fd_rpc_channel_thread.ot.instance;
 }
 
+// The OpenThread API lock is held by the OpenThread thread while it runs callbacks (UDP receive, TCP, state changed).
+// It must be held by any other thread calling the OpenThread API.
+// It also protects the ring buffers, the UDP stream, and the send state, which are shared with those callbacks.
+// Never block while holding it, the OpenThread thread would stall.
+void fd_rpc_channel_thread_lock(void) {
+    openthread_api_mutex_lock(openthread_get_default_context());
+}
+
+void fd_rpc_channel_thread_unlock(void) {
+    openthread_api_mutex_unlock(openthread_get_default_context());
+}
+
 fd_rpc_channel_thread_status_t fd_rpc_channel_thread_get_status(void) {
     return (fd_rpc_channel_thread_status_t) {
         .state = fd_rpc_channel_thread.state,
@@ -130,13 +144,15 @@ void fd_rpc_channel_thread_reset_buffers(void) {
 	ring_buf_init(&fd_rpc_channel_thread.rx_ringbuf, sizeof(fd_rpc_channel_thread.rx_ring_buffer), fd_rpc_channel_thread.rx_ring_buffer);
 	ring_buf_init(&fd_rpc_channel_thread.tx_ringbuf, sizeof(fd_rpc_channel_thread.tx_ring_buffer), fd_rpc_channel_thread.tx_ring_buffer);
     fd_rpc_channel_thread.ot.is_send_pending = false;
-    fd_binary_reset(&fd_rpc_channel_thread.rx_packet);
+    // rx_packet is only used from the work queue, so it is reset by connected_work and disconnected_work.
 }
 
 void fd_rpc_channel_thread_rx_work(struct k_work *context fd_unused) {
     while (true) {
         uint8_t data[64];
+        fd_rpc_channel_thread_lock();
         size_t length = ring_buf_get(&fd_rpc_channel_thread.rx_ringbuf, data, sizeof(data));
+        fd_rpc_channel_thread_unlock();
         if (length <= 0) {
             break;
         }
@@ -159,6 +175,13 @@ void fd_rpc_channel_thread_rx(const uint8_t *data, size_t length) {
 }
 
 void fd_rpc_channel_thread_connected_work(struct k_work *work fd_unused) {
+    if (!fd_rpc_channel_thread.is_connected) {
+        // The session went down before this work item ran.
+        return;
+    }
+
+    fd_binary_reset(&fd_rpc_channel_thread.rx_packet);
+
     fd_rpc_channel_opened(&fd_rpc_channel_thread.channel);
 
     fd_rpc_channel_thread_set_state(fd_rpc_channel_thread_state_connected);
@@ -182,6 +205,8 @@ void fd_rpc_channel_thread_connected(void) {
 
 void fd_rpc_channel_thread_disconnected_work(struct k_work *work fd_unused) {
     k_timer_stop(&fd_rpc_channel_thread.timer);
+
+    fd_binary_reset(&fd_rpc_channel_thread.rx_packet);
 
     fd_rpc_channel_closed(&fd_rpc_channel_thread.channel);
 
@@ -242,9 +267,13 @@ otError fd_rpc_channel_thread_udp_send(void) {
     return OT_ERROR_NONE;
 }
 
-void fd_rpc_channel_thread_tx(void) {
+bool fd_rpc_channel_thread_tx_locked(void) {
+    if (!fd_rpc_channel_thread.is_connected) {
+        return false;
+    }
+
     if (fd_rpc_channel_thread.ot.is_send_pending) {
-        return;
+        return false;
     }
 
     uint8_t *buffer = NULL;
@@ -252,7 +281,7 @@ void fd_rpc_channel_thread_tx(void) {
     if (length == 0) {
         int result = ring_buf_get_finish(&fd_rpc_channel_thread.tx_ringbuf, 0);
         fd_assert(result == 0);
-        return;
+        return false;
     }
 
     fd_rpc_channel_thread.ot.send_time = k_uptime_get();
@@ -267,7 +296,7 @@ void fd_rpc_channel_thread_tx(void) {
 
         int result = ring_buf_get_finish(&fd_rpc_channel_thread.tx_ringbuf, 0);
         fd_assert(result == 0);
-        return;
+        return false;
     }
 
     int result = ring_buf_get_finish(&fd_rpc_channel_thread.tx_ringbuf, length);
@@ -275,6 +304,16 @@ void fd_rpc_channel_thread_tx(void) {
 
     ++fd_rpc_channel_thread.tx_thread_count;
     fd_rpc_channel_thread.tx_thread_bytes += length;
+    return true;
+}
+
+void fd_rpc_channel_thread_tx(void) {
+    fd_rpc_channel_thread_lock();
+    bool sent = fd_rpc_channel_thread_tx_locked();
+    fd_rpc_channel_thread_unlock();
+    if (!sent) {
+        return;
+    }
 
     if (fd_rpc_channel_thread.free_space_increased_callback != NULL) {
         fd_rpc_channel_thread.free_space_increased_callback(&fd_rpc_channel_thread.channel);
@@ -286,14 +325,17 @@ void fd_rpc_channel_thread_tx_work(struct k_work *work fd_unused) {
 }
 
 bool fd_rpc_channel_thread_packet_write(const uint8_t *data, size_t size) {
+    fd_rpc_channel_thread_lock();
     uint32_t space = ring_buf_space_get(&fd_rpc_channel_thread.tx_ringbuf);
     if (size > space) {
+        fd_rpc_channel_thread_unlock();
         return false;
     }
     uint32_t length = ring_buf_put(&fd_rpc_channel_thread.tx_ringbuf, data, size);
     fd_assert(length == size);
     ++fd_rpc_channel_thread.tx_ring_count;
     fd_rpc_channel_thread.tx_ring_bytes += length;
+    fd_rpc_channel_thread_unlock();
 
     int result = k_work_submit_to_queue(fd_rpc_channel_thread.configuration.work_queue, &fd_rpc_channel_thread.tx_work);
     fd_assert(result >= 0);
@@ -303,7 +345,9 @@ bool fd_rpc_channel_thread_packet_write(const uint8_t *data, size_t size) {
 void fd_rpc_channel_thread_timer_work(struct k_work *work fd_unused) {
     fd_rpc_channel_thread_tx();
 
+    fd_rpc_channel_thread_lock();
     fd_rpc_stream_check(&fd_rpc_channel_thread.ot.udp.stream);
+    fd_rpc_channel_thread_unlock();
 }
 
 void fd_rpc_channel_thread_timer(struct k_timer *timer fd_unused) {
@@ -312,12 +356,16 @@ void fd_rpc_channel_thread_timer(struct k_timer *timer fd_unused) {
 }
 
 size_t fd_rpc_channel_thread_get_free_space(void) {
+    fd_rpc_channel_thread_lock();
     uint32_t space = ring_buf_space_get(&fd_rpc_channel_thread.tx_ringbuf);
+    fd_rpc_channel_thread_unlock();
     return space;
 }
 
 size_t fd_rpc_channel_thread_get_rx_free_space(void) {
+    fd_rpc_channel_thread_lock();
     uint32_t space = ring_buf_space_get(&fd_rpc_channel_thread.rx_ringbuf);
+    fd_rpc_channel_thread_unlock();
     return space;
 }
 
@@ -478,7 +526,9 @@ void fd_rpc_channel_thread_up(void) {
     // fd_assert(error == OT_ERROR_NONE);
     // otSrpClientEnableAutoStartMode(fd_rpc_channel_thread.ot.instance, fd_rpc_channel_thread_ot_SrpClientAutoStartCallback, NULL);
 
+    fd_rpc_channel_thread_lock();
     fd_rpc_channel_thread.ot.protocol.up();
+    fd_rpc_channel_thread_unlock();
 
     // otSrpClientService *service = &fd_rpc_channel_thread.ot.service;
     // snprintf(fd_rpc_channel_thread.ot.service_name, sizeof(fd_rpc_channel_thread.ot.service_name), "_%s._tcp", fd_rpc_channel_thread.configuration.name);
@@ -510,29 +560,50 @@ void fd_rpc_channel_thread_udp_down(void) {
     fd_assert(error == OT_ERROR_NONE);
 }
 
-void fd_rpc_channel_thread_down(void) {
-    // otSrpClientDisableAutoStartMode(fd_rpc_channel_thread.ot.instance);
-
-    if (fd_rpc_channel_thread.state > fd_rpc_channel_thread_state_started) {
-        // Removing a service is an asynchronous sequence of events.
-        // The subsequent otSrpClientStop does not allow time for this to complete.
-        // On the next start it will complete, but interfere with adding the service.
-        // So we just leave the service registered to wait for a TTL timeout.
-        // -denis
-        /*
-        otError error = otSrpClientRemoveService(fd_rpc_channel_thread.ot.instance, &fd_rpc_channel_thread.ot.service);
-        fd_assert(error == OT_ERROR_NONE);
-        */
-
-        // otSrpClientStop(fd_rpc_channel_thread.ot.instance);
-
-        fd_rpc_channel_thread.ot.protocol.down();
+// Tears down the RPC session but leaves the Thread stack running, so OpenThread can reattach on its own.
+void fd_rpc_channel_thread_session_down(void) {
+    if (fd_rpc_channel_thread.state <= fd_rpc_channel_thread_state_started) {
+        return;
     }
 
+    // otSrpClientDisableAutoStartMode(fd_rpc_channel_thread.ot.instance);
+
+    // Removing a service is an asynchronous sequence of events.
+    // The subsequent otSrpClientStop does not allow time for this to complete.
+    // On the next start it will complete, but interfere with adding the service.
+    // So we just leave the service registered to wait for a TTL timeout.
+    // -denis
+    /*
+    otError error = otSrpClientRemoveService(fd_rpc_channel_thread.ot.instance, &fd_rpc_channel_thread.ot.service);
+    fd_assert(error == OT_ERROR_NONE);
+    */
+
+    // otSrpClientStop(fd_rpc_channel_thread.ot.instance);
+
+    fd_rpc_channel_thread_lock();
+    if (fd_rpc_channel_thread.configuration.transport == fd_rpc_channel_thread_transport_udp) {
+        fd_rpc_stream_disconnect(&fd_rpc_channel_thread.ot.udp.stream);
+    }
+    fd_rpc_channel_thread.ot.protocol.down();
+    if (fd_rpc_channel_thread.is_connected) {
+        fd_rpc_channel_thread_disconnected();
+    }
+    fd_rpc_channel_thread_unlock();
+
+    fd_rpc_channel_thread_set_state(fd_rpc_channel_thread_state_started);
+}
+
+void fd_rpc_channel_thread_down(void) {
+    fd_rpc_channel_thread_session_down();
+
+    fd_rpc_channel_thread_lock();
     otError error = otThreadSetEnabled(fd_rpc_channel_thread.ot.instance, false);
     fd_assert(error == OT_ERROR_NONE);
     error = otIp6SetEnabled(fd_rpc_channel_thread.ot.instance, false);
     fd_assert(error == OT_ERROR_NONE);
+    // Update the role now, so the role change notification for disabling Thread is not seen as a detach.
+    fd_rpc_channel_thread.ot.role = OT_DEVICE_ROLE_DISABLED;
+    fd_rpc_channel_thread_unlock();
 
     fd_rpc_channel_thread_set_state(fd_rpc_channel_thread_state_none);
 }
@@ -550,6 +621,8 @@ void fd_rpc_channel_thread_set_dataset(otOperationalDataset dataset) {
 
     otInstance *ot_instance = fd_rpc_channel_thread.ot.instance;
 
+    fd_rpc_channel_thread_lock();
+
     /* Set the router selection jitter to override the 2 minute default.
        CLI cmd > routerselectionjitter 20
        Warning: For demo purposes only - not to be used in a real product */
@@ -563,6 +636,8 @@ void fd_rpc_channel_thread_set_dataset(otOperationalDataset dataset) {
     fd_assert(error == OT_ERROR_NONE);
     error = otThreadSetEnabled(ot_instance, true);
     fd_assert(error == OT_ERROR_NONE);
+
+    fd_rpc_channel_thread_unlock();
 
     fd_rpc_channel_thread_set_state(fd_rpc_channel_thread_state_started);
 }
@@ -579,25 +654,44 @@ bool fd_rpc_channel_thread_is_role_active(otDeviceRole role) {
     return false;
 }
 
+void fd_rpc_channel_thread_role_work(struct k_work *work fd_unused) {
+    fd_rpc_channel_thread_lock();
+    otDeviceRole role = otThreadGetDeviceRole(fd_rpc_channel_thread.ot.instance);
+    fd_rpc_channel_thread_unlock();
+
+    bool was_active = fd_rpc_channel_thread_is_role_active(fd_rpc_channel_thread.ot.role);
+    fd_rpc_channel_thread.ot.role = role;
+    bool is_active = fd_rpc_channel_thread_is_role_active(role);
+
+    if (fd_rpc_channel_thread.state == fd_rpc_channel_thread_state_none) {
+        // Thread is stopped, this is a late notification.
+        return;
+    }
+
+    if (!was_active && is_active && (fd_rpc_channel_thread.state == fd_rpc_channel_thread_state_started)) {
+        fd_rpc_channel_thread_up();
+    }
+    if (was_active && !is_active) {
+        // Detached - OpenThread will try to reattach by itself.
+        fd_rpc_channel_thread_session_down();
+    }
+}
+
+// Called from the OpenThread thread, so the role change is handled on the work queue.
 void fd_rpc_channel_thread_ot_StateChanged(uint32_t flags, void *context) {
     if ((flags & OT_CHANGED_THREAD_ROLE) == 0) {
         return;
     }
 
-    bool was_active = fd_rpc_channel_thread_is_role_active(fd_rpc_channel_thread.ot.role);
-    fd_rpc_channel_thread.ot.role = otThreadGetDeviceRole(context);
-    bool is_active = fd_rpc_channel_thread_is_role_active(fd_rpc_channel_thread.ot.role);
-    if (!was_active && is_active) {
-        fd_rpc_channel_thread_up();
-    }
-    if (was_active && !is_active) {
-        fd_rpc_channel_thread_down();
-    }
+    int result = k_work_submit_to_queue(fd_rpc_channel_thread.configuration.work_queue, &fd_rpc_channel_thread.role_work);
+    fd_assert(result >= 0);
 }
 
 void fd_rpc_channel_thread_initialize_ot(void) {
+    fd_rpc_channel_thread_lock();
     fd_rpc_channel_thread.ot.instance = otInstanceInitSingle();
     otSetStateChangedCallback(fd_rpc_channel_thread.ot.instance, fd_rpc_channel_thread_ot_StateChanged, fd_rpc_channel_thread.ot.instance);
+    fd_rpc_channel_thread_unlock();
 }
 
 void fd_rpc_channel_thread_udp_stream_received_connect(struct fd_rpc_stream_s *stream) {
@@ -609,17 +703,8 @@ void fd_rpc_channel_thread_udp_stream_received_disconnect(struct fd_rpc_stream_s
 }
 
 void fd_rpc_channel_thread_udp_stream_received_keep_alive(struct fd_rpc_stream_s *stream) {
-    // really connected
-    if (fd_rpc_channel_thread.state != fd_rpc_channel_thread_state_connected) {
-        fd_rpc_channel_thread_set_state(fd_rpc_channel_thread_state_connected);
-
-        for (uint32_t i = 0; i < fd_rpc_channel_thread.listener_count; ++i) {
-            const fd_rpc_channel_thread_listener_t *listener = fd_rpc_channel_thread.listeners[i];
-            if (listener->connected != NULL) {
-                listener->connected();
-            }
-        }
-    }
+    // The stream only reports keep alives when it is connected, and connected_work marks the channel connected.
+    // A keep alive on a disconnected stream is answered with a disconnect by the stream, so the peer reconnects.
 }
 
 void fd_rpc_channel_thread_udp_stream_received_data(struct fd_rpc_stream_s *stream, const uint8_t *data, size_t length) {
@@ -720,6 +805,7 @@ void fd_rpc_channel_thread_initialize(const fd_rpc_channel_thread_configuration_
 
     k_timer_init(&fd_rpc_channel_thread.timer, fd_rpc_channel_thread_timer, 0);
     k_work_init(&fd_rpc_channel_thread.timer_work, fd_rpc_channel_thread_timer_work);
+    k_work_init(&fd_rpc_channel_thread.role_work, fd_rpc_channel_thread_role_work);
 
     k_work_init(&fd_rpc_channel_thread.rx_work, fd_rpc_channel_thread_rx_work);
     k_work_init(&fd_rpc_channel_thread.tx_work, fd_rpc_channel_thread_tx_work);

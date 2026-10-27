@@ -195,13 +195,17 @@ void fd_rpc_stream_send_connect_response(fd_rpc_stream_t *stream, uint8_t result
     fd_rpc_stream_send_command(stream, data, binary.put_index);
 }
 
-void fd_rpc_stream_send_disconnect(fd_rpc_stream_t *stream) {
+void fd_rpc_stream_send_disconnect_command(fd_rpc_stream_t *stream) {
     uint8_t data[16];
     fd_binary_t binary;
     fd_binary_initialize(&binary, data, sizeof(data));
     fd_binary_put_uint32(&binary, fd_rpc_stream_command_disconnect | fd_rpc_stream_header_type_command);
     fd_assert(binary.errors == 0);
     fd_rpc_stream_send_command(stream, data, binary.put_index);
+}
+
+void fd_rpc_stream_send_disconnect(fd_rpc_stream_t *stream) {
+    fd_rpc_stream_send_disconnect_command(stream);
 
     fd_rpc_stream_disconnect(stream);
     stream->client->sent_disconnect(stream);
@@ -237,7 +241,9 @@ void fd_rpc_stream_send_nack(fd_rpc_stream_t *stream) {
 }
 
 bool fd_rpc_stream_wait_for_send_ack(fd_rpc_stream_t *stream) {
-    int result = k_sem_take(&stream->send_semaphore, K_SECONDS(5));
+    // Does not block: the caller holds the OpenThread lock, and the ack is received on the OpenThread thread.
+    // The caller only sends when the previous send is done, so the semaphore is normally available.
+    int result = k_sem_take(&stream->send_semaphore, K_NO_WAIT);
     return result == 0;
 }
 
@@ -348,6 +354,11 @@ void fd_rpc_stream_receive(fd_rpc_stream_t *stream, const uint8_t *data, size_t 
                 fd_rpc_stream_receive_disconnect_request(stream);
                 break;
             case fd_rpc_stream_command_keep_alive:
+                if (stream->state != fd_rpc_stream_state_connected) {
+                    // The peer still thinks the stream is connected, tell it otherwise so it reconnects.
+                    fd_rpc_stream_send_disconnect_command(stream);
+                    break;
+                }
                 stream->client->received_keep_alive(stream);
                 break;
             case fd_rpc_stream_command_ack:
@@ -366,6 +377,9 @@ void fd_rpc_stream_receive(fd_rpc_stream_t *stream, const uint8_t *data, size_t 
     } else {
         if (stream->state == fd_rpc_stream_state_connected) {
             fd_rpc_stream_receive_data(stream, header, &data[4], length - 4);
+        } else {
+            // Same as for a keep alive - the peer is sending data on a stream that is no longer connected.
+            fd_rpc_stream_send_disconnect_command(stream);
         }
     }
 }

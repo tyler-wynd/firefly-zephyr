@@ -87,6 +87,9 @@ void fd_rpc_stream_initialize(fd_rpc_stream_t *stream, const fd_rpc_stream_clien
 
 void fd_rpc_stream_check(fd_rpc_stream_t *stream);
 
+// Resets the stream to disconnected without sending anything to the peer.
+void fd_rpc_stream_disconnect(fd_rpc_stream_t *stream);
+
 void fd_rpc_stream_send_disconnect(fd_rpc_stream_t *stream);
 
 void fd_rpc_stream_send_keep_alive(fd_rpc_stream_t *stream);
